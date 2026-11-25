@@ -1,0 +1,11 @@
+{
+  "duration": 33.6,
+  "moments": {
+    "coconutFalls": 2.2, "coconutLands": 2.7, "slash": 4.8, "pourStarts": 5.7, "pourEnds": 7.0,
+    "capOn": 7.0, "nameLands": 7.2, "benefitsStart": 13.4, "coldStarts": 20.4, "endCardStarts": 24.0
+  },
+  "voice": {
+    "heat": 0.4, "real": 2.3, "name": 7.2, "pure": 10.7, "hydrating": 13.7, "electrolytes": 15.3,
+    "potassium": 16.9, "sugar": 18.3, "cold": 20.7, "order": 24.3, "phone": 27.3
+  }
+}

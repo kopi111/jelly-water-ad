@@ -1,0 +1,12 @@
+Jelly Water market video (2026-11-09)
+[x] Voice-over lines recorded and timed (build_voice.py)
+[x] Brand art exported from the label code (build_brand_art.py)
+[x] Animated scenes (scene.html)
+[x] Original backing track and sound effects (build_soundtrack.py)
+[x] Frames rendered and encoded (render_video.py)
+[x] Checked frame by frame, copied to ~/Desktop/Videos
+Rules: only claims printed on the label. No price (website prices are placeholders).
+
+V2 (2026-11-09): real footage clips (sip, chill) and licensed Mixkit reggae track.
+[x] V1 sources backed up in v1/
+[x] Clips cut in, music swapped, rendered, checked, saved as Jelly-Water-Ad-V2.mp4

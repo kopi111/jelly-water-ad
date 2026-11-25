@@ -1,0 +1,529 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@700&family=Poppins:wght@600;700;800&display=block">
+<style>
+  /* The video frame. Everything is placed by render(t), so nothing here animates by itself. */
+  html, body { margin: 0; background: #000; }
+  #stage { position: relative; width: 1080px; height: 1920px; overflow: hidden; font-family: Poppins, sans-serif; }
+  .layer, .piece { position: absolute; left: 0; top: 0; }
+  .layer { width: 1080px; height: 1920px; }
+  .piece { will-change: transform; transform-origin: center; }
+  .line { width: 1080px; text-align: center; white-space: nowrap; }
+  .round { font-family: Fredoka, sans-serif; font-weight: 700; }
+  .heavy { font-weight: 800; }
+  #hotBackground { background: linear-gradient(180deg, #ff7a00 0%, #ffa200 45%, #ffd21f 100%); }
+  #greenBackground { background: linear-gradient(145deg, #5cc55e 0%, #0b8f3d 55%, #04441f 100%); }
+  #coldBackground { background: linear-gradient(180deg, #04441f 0%, #0a7a70 55%, #74d6cb 100%); }
+  #goldBackground { background: radial-gradient(circle at 50% 48%, #ffe766 0%, #ffd21f 60%, #e8b800 100%); }
+  .benefit { left: 340px; width: 620px; height: 200px; border-radius: 36px; display: flex; align-items: center; padding-left: 22px; box-sizing: border-box; }
+  .benefit .tick { width: 92px; height: 92px; flex: none; margin-right: 22px; }
+  .benefit small { display: block; font-size: 42px; font-weight: 700; line-height: 1.1; }
+  .benefit b { display: block; font-size: 72px; font-weight: 800; line-height: 1.08; }
+  .drop, .cube { position: absolute; left: 0; top: 0; }
+  .cube { width: 120px; height: 120px; border-radius: 26px; background: rgba(255,255,255,.28); border: 5px solid rgba(255,255,255,.75); box-sizing: border-box; }
+  .juice { position: absolute; left: 0; top: 0; width: 26px; height: 26px; border-radius: 50%; background: #f4f8ec; }
+</style>
+<div id="stage"></div>
+<script src="brand_art.js"></script>
+<script>
+"use strict";
+
+// ---------- Small maths helpers used by every scene ----------
+
+// Keeps a number between 0 and 1.
+const clampToUnit = value => Math.min(1, Math.max(0, value));
+// How far t has travelled from start to end, as 0 to 1.
+const progress = (t, start, end) => clampToUnit((t - start) / (end - start));
+// Starts fast and settles gently.
+const easeOut = p => 1 - Math.pow(1 - p, 3);
+// Moves smoothly at both ends.
+const easeBoth = p => p * p * (3 - 2 * p);
+// Overshoots a little and wobbles to rest, like something landing.
+const bounce = p => p >= 1 ? 1 : 1 - Math.exp(-6 * p) * Math.cos(11 * p);
+// Blends between two numbers.
+const blend = (from, to, p) => from + (to - from) * p;
+// A repeatable random number source, so every render of the video comes out the same.
+function seededRandom(seed) {
+  return () => {
+    seed = (seed + 0x6D2B79F5) | 0;
+    let mixed = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- Helpers that build and place things on the stage ----------
+
+const stage = document.getElementById("stage");
+
+// Adds one HTML element to a parent and returns it.
+function addElement(parent, className, html = "", id = "") {
+  const element = document.createElement("div");
+  element.className = className;
+  element.innerHTML = html;
+  if (id) element.id = id;
+  parent.appendChild(element);
+  return element;
+}
+
+// Moves, sizes, turns and fades one element.
+function place(element, { x = 0, y = 0, scale = 1, rotate = 0, opacity = 1 }) {
+  element.style.transform = `translate(${x}px, ${y}px) rotate(${rotate}deg) scale(${scale})`;
+  element.style.opacity = opacity;
+}
+
+// Adds a full-width line of centred text.
+function addLine(parent, html, fontClass, fontSize, colour) {
+  const line = addElement(parent, `piece line ${fontClass}`, html);
+  line.style.fontSize = `${fontSize}px`;
+  line.style.color = colour;
+  return line;
+}
+
+// A time far past the end of the video, for things that stay on screen once they arrive.
+const NEVER = 1e6;
+
+// Makes text punch in from large to normal size at a moment in time, then leave at another.
+function slamText(element, t, y, arrives, leaves = NEVER) {
+  const arrival = easeOut(progress(t, arrives, arrives + 0.16));
+  const departure = progress(t, leaves, leaves + 0.15);
+  place(element, { y, scale: blend(1.8, 1, arrival), opacity: Math.min(arrival * 3, 1 - departure) });
+}
+
+// Shows or hides a whole layer between two times.
+function showBetween(element, t, start, end) {
+  element.style.display = t >= start && t < end ? "block" : "none";
+}
+
+// ---------- The timeline, handed over from timeline.json ----------
+
+let moments, voice, duration, clips;
+
+// ---------- Real footage, shown one saved frame at a time ----------
+
+const FOOTAGE_FRAMES_PER_SECOND = 30;
+const footageClips = [];
+
+// Adds a clip's picture and the dark fade that keeps text readable on top of it.
+function addFootage(parent, clipName) {
+  const details = clips.find(clip => clip.name === clipName);
+  const picture = document.createElement("img");
+  picture.className = "layer";
+  parent.appendChild(picture);
+  const shade = addElement(parent, "layer");
+  shade.style.background = "linear-gradient(180deg, rgba(0,0,0,.62) 0%, rgba(0,0,0,0) 46%)";
+  const footage = { ...details, picture, shade };
+  footageClips.push(footage);
+  return footage;
+}
+
+// Shows the right frame of one clip, and waits until the picture is ready to be photographed.
+function renderFootage(footage, t) {
+  const playing = t >= footage.start && t < footage.end;
+  footage.picture.style.display = footage.shade.style.display = playing ? "block" : "none";
+  if (!playing) return Promise.resolve();
+  const lastFrame = Math.floor((footage.end - footage.start) * FOOTAGE_FRAMES_PER_SECOND);
+  const frameNumber = Math.min(lastFrame, Math.floor((t - footage.start) * FOOTAGE_FRAMES_PER_SECOND) + 1);
+  footage.picture.src = `clip_frames/${footage.name}/f${String(frameNumber).padStart(4, "0")}.jpg`;
+  return footage.picture.decode();
+}
+
+// ---------- Scene 1: the hot sun ----------
+
+const hot = { rays: "" };
+
+function buildHotScene() {
+  hot.layer = addElement(stage, "layer", "", "hotBackground");
+  const rays = Array.from({ length: 16 }, (_, index) =>
+    `<rect x="478" y="-120" width="44" height="170" rx="22" fill="#fff3a6" transform="rotate(${index * 22.5} 500 500)"/>`).join("");
+  hot.rays = addElement(hot.layer, "piece", `<svg width="1000" height="1000" viewBox="-160 -160 1320 1320">${rays}</svg>`);
+  hot.sun = addElement(hot.layer, "piece", `<svg width="1000" height="1000"><circle cx="500" cy="500" r="330" fill="#ffe766"/></svg>`);
+  hot.footage = addFootage(hot.layer, "sip");
+  hot.hotSun = addLine(hot.layer, "HOT SUN.", "round", 188, "#10200f");
+  hot.longDay = addLine(hot.layer, "LONG DAY.", "round", 188, "#ffffff");
+  hot.longDay.style.textShadow = "0 9px 0 #10200f";
+  hot.needLine = addLine(hot.layer, "You need", "heavy", 112, "#ffffff");
+  hot.somethingLine = addLine(hot.layer, "something", "heavy", 112, "#ffffff");
+  hot.realLine = addLine(hot.layer, "REAL.", "round", 230, "#ffd21f");
+  [hot.needLine, hot.somethingLine, hot.realLine].forEach(line => { line.style.textShadow = "0 8px 0 #10200f"; });
+}
+
+function renderHotScene(t) {
+  showBetween(hot.layer, t, 0, moments.slash + 0.7);
+  const pulse = 1 + 0.05 * Math.sin(t * 5);
+  place(hot.rays, { x: 40, y: 730, rotate: t * 24, scale: blend(0.5, 1.15, easeOut(progress(t, 0, 1))) * pulse });
+  place(hot.sun, { x: 40, y: 730, scale: blend(0.5, 1.15, easeOut(progress(t, 0, 1))) * pulse });
+  slamText(hot.hotSun, t, 290, voice.heat, voice.real - 0.25);
+  slamText(hot.longDay, t, 520, voice.heat + 0.75, voice.real - 0.25);
+  slamText(hot.needLine, t, 190, voice.real, moments.slash);
+  slamText(hot.somethingLine, t, 320, voice.real + 0.28, moments.slash);
+  slamText(hot.realLine, t, 450, voice.real + 0.7, moments.slash);
+}
+
+// ---------- Scene 2: the coconut is cut ----------
+
+const cut = { juice: [] };
+const COCONUT_REST = { x: 540, y: 1180 };
+const CUT_LINE_Y = 1076;
+
+function buildGreenBackground() {
+  cut.green = addElement(stage, "layer", "", "greenBackground");
+}
+
+function buildCoconut() {
+  const lid = `<path d="M125 137 C140 72 260 72 275 137 Q200 176 125 137 Z" fill="url(#husk)"/>`;
+  cut.coconut = addElement(stage, "piece",
+    `<svg width="640" height="640" viewBox="0 0 400 400" style="overflow:visible"><g id="straw">${ART.straw}</g>${ART.coconutBody}<g id="lid">${lid}</g></svg>`);
+  cut.straw = document.getElementById("straw");
+  cut.lid = document.getElementById("lid");
+  cut.slash = addElement(stage, "piece", "");
+  cut.slash.style.cssText = "height:24px;width:1500px;background:#fff;border-radius:12px;box-shadow:0 0 50px #fff";
+  cut.flash = addElement(stage, "layer", "");
+  cut.flash.style.background = "#fff";
+  const random = seededRandom(7);
+  for (let index = 0; index < 26; index++) {
+    cut.juice.push({ element: addElement(stage, "juice"), angle: -Math.PI * random(), speed: 900 + 1100 * random(), size: 0.6 + 1.3 * random() });
+  }
+  cut.stream = addElement(stage, "piece", "");
+  cut.stream.style.cssText = "width:34px;left:523px;height:10px;background:linear-gradient(90deg,#d8ecbe,#fafdf0,#d8ecbe);border-radius:17px;transform-origin:top";
+}
+
+// Where the coconut is: falling, resting, then up and tipped over the bottle, then gone.
+function coconutPose(t) {
+  const fall = progress(t, moments.coconutFalls, moments.coconutLands);
+  const rise = easeBoth(progress(t, moments.slash + 0.45, moments.pourStarts));
+  const leave = easeBoth(progress(t, moments.pourEnds, moments.nameLands));
+  const restY = blend(-500, COCONUT_REST.y, fall * fall);
+  const squash = t > moments.coconutLands ? 0.14 * Math.exp(-7 * (t - moments.coconutLands)) * Math.cos(16 * (t - moments.coconutLands)) : 0;
+  return {
+    x: COCONUT_REST.x - 320, y: blend(restY, 250, rise) - 320 - 700 * leave,
+    rotate: blend(0, 172, rise), scale: blend(1 + squash, 0.62, rise),
+  };
+}
+
+function renderCoconut(t) {
+  const visible = t >= moments.coconutFalls && t < moments.nameLands + 0.1;
+  cut.coconut.style.display = visible ? "block" : "none";
+  if (!visible) return;
+  place(cut.coconut, coconutPose(t));
+  const lidFlight = progress(t, moments.slash, moments.slash + 0.7);
+  cut.lid.setAttribute("transform", `translate(${260 * lidFlight} ${-900 * lidFlight + 700 * lidFlight * lidFlight}) rotate(${300 * lidFlight} 200 110)`);
+  cut.lid.style.opacity = lidFlight >= 1 ? 0 : 1;
+  const strawDrop = bounce(progress(t, moments.slash + 0.15, moments.slash + 0.55));
+  cut.straw.setAttribute("transform", `translate(0 ${-340 * (1 - strawDrop)})`);
+  cut.straw.style.opacity = t > moments.slash + 0.15 && t < moments.slash + 0.7 ? 1 : 0;
+}
+
+function renderSlashAndSplash(t) {
+  const sinceSlash = t - moments.slash;
+  const slashActive = sinceSlash >= 0 && sinceSlash < 0.28;
+  cut.slash.style.display = slashActive ? "block" : "none";
+  if (slashActive) place(cut.slash, { x: blend(-1600, 90, easeOut(progress(sinceSlash, 0, 0.1))), y: CUT_LINE_Y, rotate: -7, opacity: 1 - progress(sinceSlash, 0.14, 0.28) });
+  cut.flash.style.display = sinceSlash >= 0 && sinceSlash < 0.18 ? "block" : "none";
+  cut.flash.style.opacity = 0.75 * (1 - progress(sinceSlash, 0, 0.18));
+  cut.juice.forEach(drop => renderJuiceDrop(drop, sinceSlash));
+}
+
+// Throws one drop of coconut water out of the cut and lets gravity pull it down.
+function renderJuiceDrop(drop, sinceSlash) {
+  const active = sinceSlash >= 0 && sinceSlash < 1.1;
+  drop.element.style.display = active ? "block" : "none";
+  if (!active) return;
+  const x = 540 + Math.cos(drop.angle) * drop.speed * sinceSlash;
+  const y = CUT_LINE_Y + Math.sin(drop.angle) * drop.speed * sinceSlash + 2600 * sinceSlash * sinceSlash;
+  place(drop.element, { x, y, scale: drop.size, opacity: 1 });
+}
+
+// The stream of coconut water from the tipped coconut down to the level inside the bottle.
+function renderStream(t, surfaceY) {
+  const active = t >= moments.pourStarts && t < moments.pourEnds;
+  cut.stream.style.display = active ? "block" : "none";
+  if (!active) return;
+  const streamTop = 310;
+  cut.stream.style.height = `${surfaceY - streamTop}px`;
+  cut.stream.style.transform = `translateY(${streamTop}px) scaleX(${1 + 0.1 * Math.sin(t * 40)})`;
+}
+
+// ---------- The bottle, which stays on stage from the pour to the end card ----------
+
+const bottle = { drops: [] };
+const BOTTLE_WIDTH = 360, BOTTLE_HEIGHT = 1080, BOTTLE_TOP_OF_LIQUID = 29, BOTTLE_BASE = 298;
+const LABEL_LEFT = 8, LABEL_WIDTH = 84, LABEL_TOP = 100, LABEL_HEIGHT = 145;
+
+function buildBottle() {
+  bottle.sunBehind = addElement(stage, "piece", `<svg width="900" height="900"><circle cx="450" cy="450" r="440" fill="url(#sun)"/></svg>`);
+  bottle.element = addElement(stage, "piece", `
+    <svg width="${BOTTLE_WIDTH}" height="${BOTTLE_HEIGHT}" viewBox="0 0 100 300" style="overflow:visible">
+      <defs>
+        <clipPath id="liquidClip"><rect id="liquidLevel" x="0" y="${BOTTLE_BASE}" width="100" height="300"/></clipPath>
+        <clipPath id="labelClip"><rect id="labelWrap" x="50" y="${LABEL_TOP}" width="0" height="${LABEL_HEIGHT}"/></clipPath>
+      </defs>
+      <path d="${ART.outline}" fill="#ffffff" fill-opacity="0.34" stroke="#ffffff" stroke-opacity="0.6" stroke-width="1.5"/>
+      <g clip-path="url(#liquidClip)">${ART.glass}</g>
+      <g clip-path="url(#labelClip)">${ART.label}</g>
+      <g id="capGroup">${ART.cap}</g>
+      <g id="dropGroup"></g>
+    </svg>`);
+  bottle.level = document.getElementById("liquidLevel");
+  bottle.wrap = document.getElementById("labelWrap");
+  bottle.cap = document.getElementById("capGroup");
+  buildCondensation(document.getElementById("dropGroup"));
+}
+
+// Scatters beads of cold water over the bottle.
+function buildCondensation(group) {
+  const random = seededRandom(23);
+  for (let index = 0; index < 34; index++) {
+    const drop = document.createElementNS("http://www.w3.org/2000/svg", "ellipse");
+    drop.setAttribute("fill", "#ffffff");
+    group.appendChild(drop);
+    bottle.drops.push({ drop, x: 14 + 72 * random(), y: 70 + 215 * random(), radius: 0.9 + 1.5 * random(), speed: random() < 0.3 ? 9 + 12 * random() : 0 });
+  }
+}
+
+// Key positions of the bottle: time, centre x, centre y, size.
+function bottleKeyframes() {
+  return [
+    [moments.slash + 0.6, 540, 2700, 0.9], [moments.pourStarts - 0.05, 540, 1040, 0.9],
+    [moments.benefitsStart, 540, 1040, 0.9], [moments.benefitsStart + 0.5, 190, 1020, 0.74],
+    [moments.coldStarts - 0.1, 190, 1020, 0.74], [moments.coldStarts + 0.4, 540, 850, 0.82],
+    [moments.endCardStarts, 540, 850, 0.82], [moments.endCardStarts + 0.5, 540, 925, 0.5],
+  ];
+}
+
+// Works out where the bottle is at time t by easing between the two nearest keyframes.
+function bottlePose(t) {
+  const keys = bottleKeyframes();
+  if (t <= keys[0][0]) return { cx: keys[0][1], cy: keys[0][2], size: keys[0][3] };
+  for (let index = 1; index < keys.length; index++) {
+    if (t < keys[index][0]) {
+      const eased = easeOut(progress(t, keys[index - 1][0], keys[index][0]));
+      return { cx: blend(keys[index - 1][1], keys[index][1], eased), cy: blend(keys[index - 1][2], keys[index][2], eased), size: blend(keys[index - 1][3], keys[index][3], eased) };
+    }
+  }
+  const last = keys[keys.length - 1];
+  return { cx: last[1], cy: last[2], size: last[3] };
+}
+
+function renderCondensation(t) {
+  const wetness = progress(t, moments.nameLands, moments.nameLands + 1.5);
+  bottle.drops.forEach(item => {
+    const travelled = ((item.y - 70 + item.speed * t) % 215) + 70;
+    item.drop.setAttribute("cx", item.x);
+    item.drop.setAttribute("cy", item.speed ? travelled : item.y);
+    item.drop.setAttribute("rx", item.radius * wetness);
+    item.drop.setAttribute("ry", item.radius * 1.35 * wetness);
+    item.drop.setAttribute("fill-opacity", 0.72 * wetness);
+  });
+}
+
+function renderBottle(t) {
+  const visible = t >= moments.slash + 0.6;
+  bottle.element.style.display = bottle.sunBehind.style.display = visible ? "block" : "none";
+  if (!visible) return { surfaceY: 0 };
+  const { cx, cy, size } = bottlePose(t);
+  const tilt = t > moments.nameLands ? 1.6 * Math.sin((t - moments.nameLands) * 2.2) : 0;
+  place(bottle.element, { x: cx - BOTTLE_WIDTH / 2, y: cy - BOTTLE_HEIGHT / 2, scale: size, rotate: tilt });
+  const sunArrival = bounce(progress(t, moments.nameLands, moments.nameLands + 0.5));
+  const stepsAside = progress(t, moments.benefitsStart, moments.benefitsStart + 0.3) * (1 - progress(t, moments.coldStarts, moments.coldStarts + 0.3));
+  place(bottle.sunBehind, { x: cx - 450, y: cy - 450, scale: size * sunArrival, opacity: t < moments.endCardStarts ? 1 - stepsAside : 0 });
+  const fill = easeBoth(progress(t, moments.pourStarts, moments.pourEnds));
+  const levelY = blend(BOTTLE_BASE, BOTTLE_TOP_OF_LIQUID, fill);
+  bottle.level.setAttribute("y", levelY);
+  renderLabelAndCap(t);
+  renderCondensation(t);
+  return { surfaceY: cy - (BOTTLE_HEIGHT / 2) * size + levelY * 3.6 * size };
+}
+
+function renderLabelAndCap(t) {
+  const wrap = easeOut(progress(t, moments.capOn + 0.05, moments.capOn + 0.4));
+  bottle.wrap.setAttribute("x", 50 - (LABEL_WIDTH / 2) * wrap);
+  bottle.wrap.setAttribute("width", LABEL_WIDTH * wrap);
+  const capDrop = bounce(progress(t, moments.capOn - 0.15, moments.capOn + 0.1));
+  bottle.cap.setAttribute("transform", `translate(0 ${-130 * (1 - capDrop)})`);
+  bottle.cap.style.opacity = t >= moments.capOn - 0.15 ? 1 : 0;
+}
+
+// ---------- Scene 3: the name, and what is inside ----------
+
+const nameScene = {};
+
+function buildNameScene() {
+  nameScene.jelly = addLine(stage, "Jelly", "round", 250, "#ffffff");
+  nameScene.water = addLine(stage, "WATER", "heavy", 96, "#ffd21f");
+  nameScene.water.style.letterSpacing = "26px";
+  nameScene.pure = addLine(stage, "100% PURE COCONUT WATER", "heavy", 50, "#ffffff");
+  nameScene.straight = addLine(stage, "Straight from", "round", 138, "#ffffff");
+  nameScene.coconut = addLine(stage, "the coconut.", "round", 138, "#ffd21f");
+  nameScene.nothing = addElement(stage, "piece line heavy", "NOTHING ADDED");
+  nameScene.nothing.style.cssText += ";font-size:112px;line-height:190px;background:#ffd21f;color:#10200f;width:1300px;left:-110px;border-top:9px solid #10200f;border-bottom:9px solid #10200f";
+  nameScene.seal = addElement(stage, "piece", `<svg width="300" height="300" viewBox="0 0 40 40">${ART.seal}</svg>`);
+}
+
+function renderNameScene(t) {
+  const shown = t >= moments.nameLands && t < moments.benefitsStart + 0.1;
+  [nameScene.jelly, nameScene.water, nameScene.pure, nameScene.straight, nameScene.coconut, nameScene.nothing, nameScene.seal]
+    .forEach(element => { element.style.display = shown ? "block" : "none"; });
+  if (!shown) return;
+  slamText(nameScene.jelly, t, 60, moments.nameLands, voice.pure - 0.2);
+  slamText(nameScene.water, t, 345, moments.nameLands + 0.32, voice.pure - 0.2);
+  slamText(nameScene.pure, t, 462, voice.name + 1.15, voice.pure - 0.2);
+  slamText(nameScene.straight, t, 170, voice.pure, moments.benefitsStart);
+  slamText(nameScene.coconut, t, 330, voice.pure + 0.3, moments.benefitsStart);
+  const sealIn = bounce(progress(t, voice.name + 1.15, voice.name + 1.6));
+  place(nameScene.seal, { x: 730, y: 640, scale: sealIn, rotate: 12 * (1 - sealIn) + 8, opacity: t < moments.benefitsStart ? 1 : 0 });
+  const stampIn = easeOut(progress(t, voice.pure + 1.25, voice.pure + 1.42));
+  place(nameScene.nothing, { y: 1350, rotate: -5, scale: blend(1.7, 1, stampIn), opacity: Math.min(stampIn * 3, 1 - progress(t, moments.benefitsStart, moments.benefitsStart + 0.12)) });
+}
+
+// ---------- Scene 4: the benefits, each ticked as it is spoken ----------
+
+const benefits = { rows: [] };
+const BENEFIT_ROWS = [
+  { small: "Naturally", big: "hydrating", cue: "hydrating" }, { small: "Packed with", big: "electrolytes", cue: "electrolytes" },
+  { small: "Rich in", big: "potassium", cue: "potassium" }, { small: "No added", big: "sugar", cue: "sugar" },
+];
+const FIRST_ROW_Y = 470, ROW_GAP = 225;
+
+function buildBenefitsScene() {
+  benefits.why = addLine(stage, 'Why coconut <span style="color:#ffd21f">water?</span>', "round", 104, "#ffffff");
+  BENEFIT_ROWS.forEach(row => {
+    const tick = `<svg class="tick" viewBox="0 0 100 100"><circle cx="50" cy="50" r="50" fill="#ffd21f" class="disc"/><path d="M26 52 L44 70 L76 32" fill="none" stroke="#04441f" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    const element = addElement(stage, "piece benefit", `${tick}<div><small>${row.small}</small><b>${row.big}</b></div>`);
+    benefits.rows.push({ element, cue: row.cue });
+  });
+}
+
+// One row pops in on its cue, sits on gold while spoken, then rests as white text on green.
+function renderBenefitRow(row, index, t, sceneEnd) {
+  const cue = voice[row.cue];
+  const arrival = bounce(progress(t, cue - 0.12, cue + 0.33));
+  const isSpeaking = t < cue + 1.3;
+  row.element.style.background = isSpeaking ? "#ffd21f" : "transparent";
+  row.element.style.color = isSpeaking ? "#10200f" : "#ffffff";
+  row.element.querySelector(".disc").setAttribute("fill", isSpeaking ? "#ffffff" : "#ffd21f");
+  place(row.element, { x: 0, y: FIRST_ROW_Y + index * ROW_GAP, scale: arrival, opacity: Math.min(progress(t, cue - 0.12, cue), 1 - progress(t, sceneEnd - 0.2, sceneEnd)) });
+}
+
+function renderBenefitsScene(t) {
+  const shown = t >= moments.benefitsStart && t < moments.coldStarts;
+  benefits.why.style.display = shown ? "block" : "none";
+  benefits.rows.forEach(row => { row.element.style.display = shown ? "flex" : "none"; });
+  if (!shown) return;
+  slamText(benefits.why, t, 240, moments.benefitsStart + 0.05, moments.coldStarts - 0.2);
+  benefits.rows.forEach((row, index) => renderBenefitRow(row, index, t, moments.coldStarts));
+}
+
+// ---------- Scene 5: ice cold ----------
+
+const cold = { cubes: [] };
+
+function buildColdScene() {
+  cold.layer = addElement(stage, "layer", "", "coldBackground");
+  const random = seededRandom(91);
+  for (let index = 0; index < 16; index++) {
+    cold.cubes.push({ element: addElement(cold.layer, "cube"), x: 1080 * random() - 60, delay: 1.5 * random(), speed: 900 + 700 * random(), spin: 120 * random() - 60, size: 0.7 + 0.9 * random() });
+  }
+  cold.ice = addLine(stage, "ICE COLD.", "round", 200, "#ffffff");
+  cold.words = addElement(stage, "piece line heavy", '<span>Fresh</span> <span>Natural</span> <span>Jamaican</span>');
+  cold.words.style.cssText += ";font-size:62px;color:#10200f;word-spacing:22px";
+  cold.flag = addElement(stage, "piece", `<svg width="420" height="30"><rect width="140" height="30" fill="#10200f"/><rect x="140" width="140" height="30" fill="#ffd21f"/><rect x="280" width="140" height="30" fill="#0b8f3d"/></svg>`);
+}
+
+// Puts the second clip over the bottle and cubes, with the words brought back in front of it.
+function addColdFootage() {
+  cold.footage = addFootage(stage, "chill");
+  [cold.ice, cold.words, cold.flag].forEach(element => stage.appendChild(element));
+}
+
+function renderCube(cube, t) {
+  const age = t - moments.coldStarts - cube.delay;
+  cube.element.style.display = age >= 0 ? "block" : "none";
+  place(cube.element, { x: cube.x, y: -200 + (cube.speed * age) % 2200, rotate: cube.spin * age, scale: cube.size });
+}
+
+function renderColdScene(t) {
+  showBetween(cold.layer, t, moments.coldStarts, moments.endCardStarts + 0.5);
+  const reveal = 1400 * easeOut(progress(t, moments.coldStarts, moments.coldStarts + 0.4));
+  cold.layer.style.clipPath = `circle(${reveal}px at 190px 1020px)`;
+  cold.cubes.forEach(cube => renderCube(cube, t));
+  const shown = t >= moments.coldStarts && t < moments.endCardStarts;
+  cold.ice.style.display = cold.words.style.display = cold.flag.style.display = shown ? "block" : "none";
+  if (!shown) return;
+  slamText(cold.ice, t, 160, voice.cold, moments.endCardStarts);
+  [...cold.words.children].forEach((word, index) => { word.style.opacity = t >= voice.cold + 1.05 + index * 0.55 ? 1 : 0; });
+  place(cold.words, { y: 1340 });
+  place(cold.flag, { x: 330, y: 1470, opacity: progress(t, voice.cold + 1.05, voice.cold + 1.3) });
+}
+
+// ---------- Scene 6: how to order ----------
+
+const endCard = {};
+
+function buildEndCard() {
+  endCard.layer = addElement(stage, "layer", "", "goldBackground");
+  endCard.logo = addElement(stage, "piece", `<svg width="560" height="150" viewBox="0 0 415 110" style="overflow:visible">${ART.logo}</svg>`);
+  endCard.order = addLine(stage, "ORDER", "round", 210, "#04441f");
+  endCard.today = addLine(stage, "TODAY", "round", 210, "#04441f");
+  endCard.call = addLine(stage, "Call or WhatsApp", "heavy", 70, "#10200f");
+  endCard.phone = addElement(stage, "piece line heavy", '<span>(876)</span> <span>464</span>-<span>4762</span>');
+  endCard.phone.style.cssText += ";font-size:104px;line-height:190px;background:#10200f;color:#ffffff";
+  endCard.phoneGroups = [...endCard.phone.children];
+}
+
+function renderEndCard(t) {
+  const shown = t >= moments.endCardStarts;
+  [endCard.layer, endCard.logo, endCard.order, endCard.today, endCard.call, endCard.phone].forEach(element => { element.style.display = shown ? "block" : "none"; });
+  if (!shown) return;
+  endCard.layer.style.clipPath = `circle(${1500 * easeOut(progress(t, moments.endCardStarts, moments.endCardStarts + 0.45))}px at 540px 950px)`;
+  place(endCard.logo, { x: 260, y: 105, scale: easeOut(progress(t, moments.endCardStarts + 0.2, moments.endCardStarts + 0.5)) });
+  slamText(endCard.order, t, 250, voice.order);
+  slamText(endCard.today, t, 435, voice.order + 0.45);
+  slamText(endCard.call, t, 1205, voice.order + 1.2);
+  slamText(endCard.phone, t, 1310, voice.order + 1.75);
+  [0, 1.15, 2.3].forEach((offset, index) => {
+    const speaking = t >= voice.phone + offset && t < voice.phone + offset + 1.15;
+    endCard.phoneGroups[index].style.color = speaking ? "#ffd21f" : "#ffffff";
+  });
+}
+
+// ---------- Building the stage and drawing one frame ----------
+
+// Keeps the brand gradients in a tiny drawing that is never hidden, so every scene can use them.
+function addSharedGradients() {
+  const holder = addElement(stage, "piece", `<svg width="1" height="1"><defs>${ART.definitions}</defs></svg>`);
+  holder.style.opacity = 0;
+}
+
+// Puts every scene on the stage in back-to-front order.
+function setup(timeline) {
+  ({ moments, voice, duration, clips } = timeline);
+  addSharedGradients();
+  buildHotScene();
+  buildGreenBackground();
+  buildColdScene();
+  buildEndCard();
+  buildBottle();
+  addColdFootage();
+  buildCoconut();
+  buildNameScene();
+  buildBenefitsScene();
+  stage.appendChild(cut.stream);
+  stage.appendChild(cut.coconut);
+}
+
+// Draws the whole picture for one moment of the video.
+async function render(t) {
+  renderHotScene(t);
+  cut.green.style.clipPath = `circle(${1500 * easeOut(progress(t, moments.slash, moments.slash + 0.5))}px at 540px ${CUT_LINE_Y}px)`;
+  renderColdScene(t);
+  renderEndCard(t);
+  const { surfaceY } = renderBottle(t);
+  renderStream(t, surfaceY);
+  renderCoconut(t);
+  renderSlashAndSplash(t);
+  renderNameScene(t);
+  renderBenefitsScene(t);
+  await Promise.all(footageClips.map(footage => renderFootage(footage, t)));
+}
+</script>
